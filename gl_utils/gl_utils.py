@@ -1,7 +1,9 @@
 import numpy as np
 import os
 from PIL import Image
+from glob import glob
 from colorsys import rgb_to_hsv
+from matplotlib import pyplot as plt
 
 
 def greenscreen(image_path, chromakey=(0, 255, 0), tolerance=0, method='euclidean'):
