@@ -4,8 +4,112 @@ from PIL import Image
 from glob import glob
 from colorsys import rgb_to_hsv
 from matplotlib import pyplot as plt
+import nibabel as nib # DICOM/NIFTI imaging support
+from nibabel.processing import resample_from_to # reslicing DICOMs
+from nilearn import datasets # anatomical atlases
+from nilearn.image import coord_transform # NIFTI manipulation
+
+# # # # # # # # # # # # # # # #
+#        NIFTI creation       #
+# # # # # # # # # # # # # # # #
+def nearest(t,a):
+    '''
+    Returns index and value from array a that is closest to value t.
+    '''
+    i = np.abs(a-t).argmin()
+    v = a[i]
+    return i,v
+    
+def create_bin_sphere(arr_size, center, r):
+    '''
+    Creates a binary mask for a sphere with a given radius at a given midpoint.
+    See: gl_utils.draw_mni_sphere()
+    '''
+    coords = np.ogrid[:arr_size[0], :arr_size[1], :arr_size[2]]
+    distance = np.sqrt((coords[0] - center[0])**2 + (coords[1]-center[1])**2 + (coords[2]-center[2])**2) 
+    return 1*(distance <= r)
+
+def draw_mni_sphere(mni_xyz, arr_size, radius, affine, coordsystem='ras', mask_by=False, mask_atlas='harvard-oxford',
+    mask_roi="Precentral Gyrus", p_thresh=20, fname=None, debug=False):
+    '''
+    Given a point in voxel space, an affine transformation, and a millimeter radius,
+    draws a sphere around that point in world (MNI) space.
+    Returns the sphere as a nibabel image.
+    * mni_xyz: tuple of (x,y,z) of the sphere's center in MNI coordinates.
+    * arr_size: tuple of shape of your array of voxels (x, y, z).
+    * radius: in mm (float or int OK)
+    * affine: transformation from voxel to world coordinates.
+    * coordsystem: How your voxel array is oriented. Currently, only RAS is supported.
+    * mask_by: if True, clips voxels outside a specified atlas.
+        * mask_atlas: name of atlas you want to mask by. Currently, only 'harvard-oxford' supported.
+        * mask_roi: ROI name within atlas you're masking by. See also: utils.print_atlas_labels()
+        * p_thresh: Percent (0-100) probability that a voxel is in an atlas's ROI for thresholding voxels within ROI.
+    * fname: saves the nibabel image as a NIFTI file using the specified fname, unless None, then does not save file.
+    * debug: bool, controls print statements for debugging.
+
+    TO DO:
+        * add support for non-RAS coordsystems
+        * add support for clipping to other atlases (pass as arg)
+    '''
+    if coordsystem != 'ras':
+        raise Exception("Coordinate systems other than RAS have yet to be implemented. Please convert your array to RAS.")
+
+    if len(np.unique(np.diag(affine)[:-1])) != 1:
+        raise Exception("Non-cubic voxels are currently unsupported. Please check your affine.")
+
+    # get column, row, slice of specified MNI coordinate in the voxel array
+    x, y, z = mni_xyz
+    c, _ = nearest(x, np.array([coord_transform(r,0,0,affine)[0] for r in np.arange(arr_size[0])]))
+    r, _ = nearest(y, np.array([coord_transform(0,a,0,affine)[1] for a in np.arange(arr_size[1])]))
+    s, _ = nearest(z, np.array([coord_transform(0,0,s,affine)[2] for s in np.arange(arr_size[2])]))
+    crs = [c,r,s]
+
+    # convert voxels to mm
+    vx_mm_ratio = np.diag(affine)[0]
+    radius_vx = np.ceil(radius/vx_mm_ratio)
+
+    sphere = create_bin_sphere(arr_size, crs, radius_vx).astype(float)
+
+    if mask_by:
+        if mask_atlas not in ['harvard-oxford']:
+            raise Exception(f"Unsupported atlas {mask_atlas}.")
+        atlas = datasets.fetch_atlas_harvard_oxford("cort-prob-1mm")
+        if mask_roi not in atlas['labels']:
+            raise Exception(f"ROI {mask_roi} not found in {mask_atlas} atlas. Please double-check atlas labels using utils.print_atlas_labels().")
+        # Extract ROI, convert to 3D   
+        atlas_4d = atlas['maps'].get_fdata()
+        roi_idx = atlas['labels'].index(mask_roi) - 1 # -1 because of "Background"
+        atlas_thresh = (atlas_4d[:,:,:,roi_idx] > p_thresh).astype(float)
+        roi = nib.Nifti1Image(atlas_thresh, atlas['maps'].affine)
+        # Resize to match voxel space's dimensions and binarize to make a mask
+        roi_zoom = resample_from_to(roi, (arr_size, affine))
+        roi_resp = roi_zoom.get_fdata()
+        mask = (roi_resp > 0.75).astype(float) # 0.75 was arbitrated based on looking at histograms of resliced ROIs
+        # Clip the sphere (sorry for spaghetti code)
+        sphere_clipped = np.zeros(sphere.shape)
+        cols, rows, slices = sphere.shape
+        for c in np.arange(cols):
+            for r in np.arange(rows):
+                for s in np.arange(slices):
+                    if sphere[c,r,s] == 1 and mask[c,r,s] == 1:
+                        sphere_clipped[c,r,s] = 1
+        if debug:
+            nvoxels = sum(sphere.ravel())
+            nvoxels_clipped = sum(sphere_clipped.ravel())
+            print(f"Orig sphere contained {nvoxels} voxels; clipped sphere contains {nvoxels_clipped} (%.2f%%)"%(nvoxels_clipped/nvoxels))
+        # Overwrite orig sphere with clipped one
+        sphere = sphere_clipped
+
+    # Return sphere (and save if specified in args)
+    nifti = nib.Nifti1Image(sphere, affine)
+    if fname is not None:
+        nib.save(nifti, fname)
+    return nifti
 
 
+# # # # # # # # # # # # # # # #
+# Screenshot post-processing  #
+# # # # # # # # # # # # # # # #
 def greenscreen(image_path, chromakey=(0, 255, 0), tolerance=0, method='euclidean'):
     """
     Convert green screen background to transparent pixels.
